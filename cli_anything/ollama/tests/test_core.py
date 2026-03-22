@@ -5,6 +5,7 @@ Uses synthetic data only. No external dependencies (no Ollama server required).
 Run: pytest cli_anything/ollama/tests/test_core.py -v
 """
 
+import base64
 import json
 import os
 import tempfile
@@ -422,3 +423,90 @@ class TestExport:
         assert result["preset"] == "md"
         assert result["file_size"] > 0
         assert result["messages_exported"] == 2  # user + assistant (not system)
+
+
+# ===========================================================================
+# backend helpers (no server required — pure function tests)
+# ===========================================================================
+
+class TestBackendHelpers:
+    def test_encode_image_roundtrip(self, tmp_dir):
+        """encode_image reads a file and returns valid base64."""
+        from cli_anything.ollama.utils.ollama_backend import encode_image
+        # Create a tiny fake PNG (just bytes, not a real image)
+        img_path = os.path.join(tmp_dir, "test.png")
+        raw = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        with open(img_path, "wb") as f:
+            f.write(raw)
+        encoded = encode_image(img_path)
+        assert isinstance(encoded, str)
+        decoded = base64.b64decode(encoded)
+        assert decoded == raw
+
+    def test_encode_image_missing_file(self, tmp_dir):
+        """encode_image raises FileNotFoundError for missing file."""
+        from cli_anything.ollama.utils.ollama_backend import encode_image
+        with pytest.raises(FileNotFoundError):
+            encode_image(os.path.join(tmp_dir, "nonexistent.jpg"))
+
+    def test_compare_result_structure(self):
+        """compare() result list has the expected schema (mocked)."""
+        from unittest.mock import patch
+        from cli_anything.ollama.utils import ollama_backend as bk
+
+        # Patch generate to return a fake single chunk per model
+        def fake_generate(model, prompt, system=None, options=None, stream=True, **kw):
+            yield {"response": f"answer from {model}", "done": True, "eval_duration": 1_000_000}
+
+        with patch.object(bk, "_require_server"), \
+             patch.object(bk, "generate", side_effect=fake_generate):
+            results = bk.compare(["modelA", "modelB"], prompt="test")
+
+        assert len(results) == 2
+        assert results[0]["model"] == "modelA"
+        assert results[1]["model"] == "modelB"
+        assert "answer from modelA" in results[0]["response"]
+        assert results[0]["eval_duration_ms"] == 1  # 1_000_000 ns = 1 ms
+        assert results[0]["error"] is None
+
+    def test_compare_handles_model_error(self):
+        """compare() captures per-model errors without crashing."""
+        from unittest.mock import patch
+        from cli_anything.ollama.utils import ollama_backend as bk
+
+        def erroring_generate(model, prompt, **kw):
+            if model == "badmodel":
+                raise RuntimeError("model not found")
+            yield {"response": "ok", "done": True, "eval_duration": 500_000}
+
+        with patch.object(bk, "_require_server"), \
+             patch.object(bk, "generate", side_effect=erroring_generate):
+            results = bk.compare(["goodmodel", "badmodel"], prompt="test")
+
+        by_model = {r["model"]: r for r in results}
+        assert by_model["goodmodel"]["error"] is None
+        assert by_model["badmodel"]["error"] is not None
+        assert "not found" in by_model["badmodel"]["error"]
+
+    def test_capabilities_parses_list(self):
+        """capabilities() normalizes the list from show()."""
+        from unittest.mock import patch
+        from cli_anything.ollama.utils import ollama_backend as bk
+
+        fake_show = {"capabilities": ["completion", "tools", "vision"],
+                     "details": {}}
+        with patch.object(bk, "show", return_value=fake_show):
+            caps = bk.capabilities("llava")
+
+        assert "vision" in caps
+        assert "tools" in caps
+        assert "completion" in caps
+
+    def test_capabilities_empty_model(self):
+        """capabilities() returns empty list if model has no capabilities field."""
+        from unittest.mock import patch
+        from cli_anything.ollama.utils import ollama_backend as bk
+
+        with patch.object(bk, "show", return_value={"details": {}}):
+            caps = bk.capabilities("basic-model")
+        assert caps == []

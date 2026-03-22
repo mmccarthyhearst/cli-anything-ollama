@@ -7,11 +7,17 @@ Streaming responses use NDJSON (one JSON object per line).
 
 from __future__ import annotations
 
+import base64
+import concurrent.futures
 import json
 import os
+import re
 from typing import Any, Callable, Generator, Optional
 
 import requests
+
+_OLLAMA_REGISTRY_URL = "https://ollama.com/api/tags"
+_OLLAMA_SEARCH_URL = "https://ollama.com/search"
 
 
 def _get_host() -> str:
@@ -279,6 +285,202 @@ def embed(
     if result.get("error"):
         raise RuntimeError(f"Embed error: {result['error']}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Model discovery (ollama.com registry)
+# ---------------------------------------------------------------------------
+
+def search_models(
+    query: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    Search the Ollama model library at ollama.com/search.
+
+    Scrapes the HTML search page (no public JSON API exists) and returns
+    list of {name, url} dicts. Does NOT require the local Ollama server.
+    """
+    try:
+        r = requests.get(
+            _OLLAMA_SEARCH_URL,
+            params={"q": query},
+            headers={"User-Agent": "cli-anything-ollama/1.0"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        # Extract model names from href="/library/<name>" links
+        names = re.findall(r'href="/library/([a-z0-9_.-][a-z0-9_.:-]*)"', r.text)
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        results: list[dict[str, Any]] = []
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                results.append({"name": name, "url": f"https://ollama.com/library/{name}"})
+        return results[:limit]
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            "Cannot reach ollama.com. Check your internet connection."
+        )
+
+
+def capabilities(model: str) -> list[str]:
+    """
+    Return the capability tags for a model: completion, tools, vision,
+    embedding, thinking, image, insert.
+
+    Calls /api/show and extracts the capabilities field.
+    """
+    info = show(model)
+    caps = info.get("capabilities", [])
+    # Normalize — may come back as strings or dicts
+    return [c if isinstance(c, str) else str(c) for c in caps]
+
+
+# ---------------------------------------------------------------------------
+# Multi-model comparison
+# ---------------------------------------------------------------------------
+
+def compare(
+    models: list[str],
+    prompt: str,
+    system: Optional[str] = None,
+    options: Optional[dict[str, Any]] = None,
+    timeout_per_model: int = 120,
+) -> list[dict[str, Any]]:
+    """
+    Run the same prompt across multiple models in parallel (thread pool).
+
+    Returns list of:
+      {"model": str, "response": str, "error": str|None,
+       "eval_duration_ms": int|None}
+    """
+    _require_server()
+
+    def _run_one(model: str) -> dict[str, Any]:
+        try:
+            chunks = list(generate(
+                model=model,
+                prompt=prompt,
+                system=system,
+                options=options,
+                stream=False,
+            ))
+            final = chunks[-1] if chunks else {}
+            duration_ns = final.get("eval_duration")
+            return {
+                "model": model,
+                "response": final.get("response", ""),
+                "error": None,
+                "eval_duration_ms": round(duration_ns / 1_000_000) if duration_ns else None,
+            }
+        except Exception as e:
+            return {"model": model, "response": "", "error": str(e), "eval_duration_ms": None}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as pool:
+        futures = {pool.submit(_run_one, m): m for m in models}
+        results = []
+        for future in concurrent.futures.as_completed(futures, timeout=timeout_per_model * len(models)):
+            results.append(future.result())
+
+    # Return in original model order
+    order = {m: i for i, m in enumerate(models)}
+    return sorted(results, key=lambda r: order.get(r["model"], 999))
+
+
+# ---------------------------------------------------------------------------
+# Vision / multimodal helpers
+# ---------------------------------------------------------------------------
+
+def encode_image(path: str) -> str:
+    """Read an image file and return a base64-encoded string for the API."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def chat_with_images(
+    model: str,
+    messages: list[dict[str, Any]],
+    image_paths: Optional[list[str]] = None,
+    options: Optional[dict[str, Any]] = None,
+    stream: bool = True,
+) -> Generator[dict[str, Any], None, None]:
+    """
+    Send a chat message with attached images (for vision-capable models).
+
+    image_paths: list of local file paths to encode and attach to the
+    last user message. Encodes each image as base64.
+    """
+    _require_server()
+    msg_list = [dict(m) for m in messages]  # shallow copy
+
+    if image_paths:
+        encoded = [encode_image(p) for p in image_paths]
+        # Attach images to the last user message
+        for i in range(len(msg_list) - 1, -1, -1):
+            if msg_list[i].get("role") == "user":
+                msg_list[i] = dict(msg_list[i])
+                msg_list[i]["images"] = encoded
+                break
+
+    yield from chat(model=model, messages=msg_list, options=options, stream=stream)
+
+
+# ---------------------------------------------------------------------------
+# Tool calling helpers
+# ---------------------------------------------------------------------------
+
+def chat_with_tools(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    options: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Run a non-streaming chat with tools defined. Returns the full final
+    response including any tool_calls the model emitted.
+
+    tools format (OpenAI-compatible, which Ollama accepts):
+    [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"]
+          }
+        }
+      }
+    ]
+
+    Returns:
+      {
+        "content": str,
+        "tool_calls": [{"function": {"name": str, "arguments": {...}}}],
+        "model": str,
+        "done": bool
+      }
+    """
+    _require_server()
+    chunks = list(chat(
+        model=model,
+        messages=messages,
+        tools=tools,
+        options=options,
+        stream=False,
+    ))
+    final = chunks[-1] if chunks else {}
+    msg = final.get("message", {})
+    return {
+        "model": final.get("model", model),
+        "content": msg.get("content", ""),
+        "tool_calls": msg.get("tool_calls", []),
+        "done": final.get("done", True),
+    }
 
 
 def create(

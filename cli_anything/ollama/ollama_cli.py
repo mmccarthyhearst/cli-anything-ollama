@@ -589,6 +589,55 @@ def model_stop(ctx: click.Context, model_name: str, json_output: bool) -> None:
         _skin.success(f"Unloaded: {model_name}")
 
 
+@model_group.command("search")
+@click.argument("query")
+@click.option("--limit", "-n", default=10, help="Max results to return")
+@click.option("--json", "json_output", is_flag=True)
+@click.pass_context
+@handle_error
+def model_search(ctx: click.Context, query: str, limit: int, json_output: bool) -> None:
+    """Search the Ollama model registry at ollama.com."""
+    use_json = json_output or ctx.find_root().params.get("json_output", False)
+    results = backend.search_models(query, limit=limit)
+    if use_json:
+        click.echo(json.dumps({"status": "ok", "data": results}))
+    else:
+        if not results:
+            _skin.info(f"No models found for: {query}")
+            return
+        rows = []
+        for m in results:
+            name = m.get("name", "")
+            desc = (m.get("description") or "")[:60]
+            pulls = m.get("pulls", m.get("pull_count", ""))
+            rows.append([name, str(pulls), desc])
+        _skin.table(["Name", "Pulls", "Description"], rows)
+
+
+@model_group.command("capabilities")
+@click.argument("model_name")
+@click.option("--json", "json_output", is_flag=True)
+@click.pass_context
+@handle_error
+def model_capabilities(ctx: click.Context, model_name: str, json_output: bool) -> None:
+    """Show what a model can do: completion, tools, vision, embedding, thinking."""
+    use_json = json_output or ctx.find_root().params.get("json_output", False)
+    caps = backend.capabilities(model_name)
+    all_caps = ["completion", "tools", "vision", "embedding", "thinking", "image", "insert"]
+    cap_map = {c: (c in caps) for c in all_caps}
+    if use_json:
+        click.echo(json.dumps({"status": "ok", "data": {
+            "model": model_name,
+            "capabilities": caps,
+            "capability_map": cap_map,
+        }}))
+    else:
+        _skin.status("Model", model_name)
+        for cap, supported in cap_map.items():
+            mark = "✓" if supported else "✗"
+            click.echo(f"  {mark}  {cap}")
+
+
 @model_group.command("create")
 @click.argument("model_name")
 @click.option("--file", "-f", "modelfile_path", default=None,
@@ -635,19 +684,29 @@ def chat_group() -> None:
 @chat_group.command("send")
 @click.argument("message")
 @click.option("--model", "-m", default=None, help="Override session model")
+@click.option("--image", "-i", "image_paths", multiple=True,
+              help="Image file(s) to attach (vision models). Repeatable.")
 @click.option("--json", "json_output", is_flag=True)
 @click.option("--no-stream", is_flag=True, default=False)
 @click.pass_context
 @handle_error
 def chat_send(ctx: click.Context, message: str, model: Optional[str],
-              json_output: bool, no_stream: bool) -> None:
-    """Send a message and get a response (requires --project)."""
+              image_paths: tuple, json_output: bool, no_stream: bool) -> None:
+    """Send a message and get a response (requires --project).
+
+    For vision models, attach images with --image <path> (repeatable).
+    """
     use_json = json_output or ctx.find_root().params.get("json_output", False)
     sess, sess_obj = _get_session()
 
     effective_model = model or sess["model"]
     sess_obj.snapshot()
-    project_core.add_message(sess, "user", message)
+
+    if image_paths:
+        encoded = [backend.encode_image(p) for p in image_paths]
+        project_core.add_message(sess, "user", message, images=encoded)
+    else:
+        project_core.add_message(sess, "user", message)
 
     stream = not no_stream and not use_json
     full_response = ""
@@ -696,6 +755,69 @@ def chat_history(ctx: click.Context, json_output: bool, limit: int) -> None:
             content = m.get("content", "")
             click.echo(f"\n[{role}]")
             click.echo(content)
+
+
+@chat_group.command("tools")
+@click.argument("message")
+@click.option("--model", "-m", default=None, help="Override session model")
+@click.option("--tools-file", "-t", "tools_file", default=None,
+              help="JSON file defining tools (OpenAI function-calling format)")
+@click.option("--tools-json", default=None,
+              help="Inline JSON string defining tools")
+@click.option("--json", "json_output", is_flag=True)
+@click.pass_context
+@handle_error
+def chat_tools(ctx: click.Context, message: str, model: Optional[str],
+               tools_file: Optional[str], tools_json: Optional[str],
+               json_output: bool) -> None:
+    """Send a message with tool definitions (function calling).
+
+    Requires a tools-capable model (check with: model capabilities <name>).
+    Returns the response content and any tool_calls the model emits.
+
+    Example tools JSON:
+      [{"type":"function","function":{"name":"get_weather",
+        "description":"Get weather","parameters":{"type":"object",
+        "properties":{"location":{"type":"string"}},"required":["location"]}}}]
+    """
+    use_json = json_output or ctx.find_root().params.get("json_output", False)
+    sess, sess_obj = _get_session()
+    effective_model = model or sess["model"]
+
+    # Load tools definition
+    if tools_file:
+        with open(tools_file) as f:
+            tools = json.load(f)
+    elif tools_json:
+        tools = json.loads(tools_json)
+    else:
+        raise click.ClickException(
+            "Provide tools with --tools-file <path> or --tools-json '<json>'"
+        )
+
+    sess_obj.snapshot()
+    project_core.add_message(sess, "user", message)
+
+    result = backend.chat_with_tools(
+        model=effective_model,
+        messages=sess["messages"],
+        tools=tools,
+        options=sess.get("options"),
+    )
+
+    project_core.add_message(sess, "assistant", result["content"])
+    _save_session_if_loaded()
+
+    if use_json:
+        click.echo(json.dumps({"status": "ok", "data": result}))
+    else:
+        if result["content"]:
+            click.echo(result["content"])
+        if result["tool_calls"]:
+            click.echo("\n[Tool Calls]")
+            for tc in result["tool_calls"]:
+                fn = tc.get("function", {})
+                click.echo(f"  {fn.get('name')}({json.dumps(fn.get('arguments', {}))})")
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +906,50 @@ def embed_run(ctx: click.Context, text: str, model: str, json_output: bool) -> N
         _skin.status("Model", model)
         _skin.status("Dimensions", str(len(embeddings)))
         _skin.status("Preview", str(embeddings[:5]) + "...")
+
+
+# ---------------------------------------------------------------------------
+# compare group
+# ---------------------------------------------------------------------------
+
+@cli.group("compare")
+def compare_group() -> None:
+    """Run the same prompt across multiple models and compare results."""
+
+
+@compare_group.command("run")
+@click.argument("prompt")
+@click.option("--models", "-m", required=True,
+              help="Comma-separated list of models, e.g. llama3.2,mistral,gemma")
+@click.option("--system", "-s", default=None, help="System prompt")
+@click.option("--json", "json_output", is_flag=True)
+@click.pass_context
+@handle_error
+def compare_run(ctx: click.Context, prompt: str, models: str, system: Optional[str],
+                json_output: bool) -> None:
+    """Run a prompt across multiple models in parallel and compare responses."""
+    use_json = json_output or ctx.find_root().params.get("json_output", False)
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    if not model_list:
+        raise click.ClickException("No models specified. Use --models llama3.2,mistral")
+
+    if not use_json:
+        _skin.info(f"Comparing {len(model_list)} models...")
+
+    results = backend.compare(model_list, prompt=prompt, system=system)
+
+    if use_json:
+        click.echo(json.dumps({"status": "ok", "data": results}))
+    else:
+        for r in results:
+            ms = f"  ({r['eval_duration_ms']}ms)" if r.get("eval_duration_ms") else ""
+            click.echo(f"\n{'─'*60}")
+            click.echo(f"  Model: {r['model']}{ms}")
+            click.echo(f"{'─'*60}")
+            if r.get("error"):
+                _skin.error(r["error"])
+            else:
+                click.echo(r["response"])
 
 
 # ---------------------------------------------------------------------------

@@ -367,3 +367,145 @@ class TestCLISubprocess:
         assert data["status"] == "ok"
         assert data["data"]["dimensions"] > 0
         print(f"\n  Embedding dimensions: {data['data']['dimensions']}")
+
+    # -----------------------------------------------------------------------
+    # New: multi-model support tests
+    # -----------------------------------------------------------------------
+
+    def test_model_search_json(self):
+        """model search hits ollama.com and returns results."""
+        result = self._run(["--json", "model", "search", "llama"])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["status"] == "ok"
+        results = data["data"]
+        assert isinstance(results, list)
+        assert len(results) > 0
+        # Each result should have a name field
+        assert all("name" in m for m in results)
+        print(f"\n  Search 'llama': {len(results)} results, first={results[0].get('name')}")
+
+    def test_model_search_no_results(self):
+        """model search with obscure query returns empty list gracefully."""
+        result = self._run(["--json", "model", "search", "xyzzy_no_such_model_abc123"])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["status"] == "ok"
+        assert isinstance(data["data"], list)
+
+    def test_model_capabilities_json(self, ollama_model):
+        """model capabilities returns capability_map with known keys."""
+        result = self._run(["--json", "model", "capabilities", ollama_model])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["status"] == "ok"
+        cap_data = data["data"]
+        assert cap_data["model"] == ollama_model
+        assert isinstance(cap_data["capabilities"], list)
+        assert "capability_map" in cap_data
+        known = {"completion", "tools", "vision", "embedding", "thinking", "image", "insert"}
+        assert set(cap_data["capability_map"].keys()) == known
+        print(f"\n  Capabilities: {cap_data['capabilities']}")
+
+    def test_compare_run_json(self, ollama_model):
+        """compare run with a single model returns one result entry."""
+        result = self._run([
+            "--json", "compare", "run",
+            "Reply with only the number 1.",
+            "--models", ollama_model,
+        ])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["status"] == "ok"
+        results = data["data"]
+        assert len(results) == 1
+        assert results[0]["model"] == ollama_model
+        assert len(results[0]["response"]) > 0
+        assert results[0]["error"] is None
+        print(f"\n  Compare response: '{results[0]['response'].strip()[:80]}'")
+
+    def test_chat_send_with_image(self, tmp_dir, ollama_model):
+        """chat send --image encodes image and sends to model (vision models only)."""
+        # Create a minimal valid PNG (1x1 white pixel)
+        import struct, zlib
+        def make_tiny_png():
+            def chunk(name, data):
+                c = name + data
+                return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+            ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+            raw_row = b'\x00\xff\xff\xff'
+            idat = zlib.compress(raw_row)
+            return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', idat) + chunk(b'IEND', b'')
+
+        img_path = os.path.join(tmp_dir, "test.png")
+        with open(img_path, "wb") as f:
+            f.write(make_tiny_png())
+
+        session_path = os.path.join(tmp_dir, "vision.json")
+        self._run(["--json", "session", "new", session_path, "--model", ollama_model])
+
+        result = self._run([
+            "--project", session_path,
+            "--json", "chat", "send",
+            "What color is this image?",
+            "--image", img_path,
+        ])
+        # Vision may or may not be supported on the test model;
+        # success means no crash — accept either a response or a model error
+        assert result.returncode == 0 or "vision" in result.stderr.lower() or "image" in result.stderr.lower()
+        print(f"\n  Vision test returncode: {result.returncode}")
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            print(f"  Response: '{data['data']['response'][:80]}'")
+
+    def test_chat_tools_json(self, tmp_dir, ollama_model):
+        """chat tools sends tool definition and returns tool_calls if supported."""
+        caps = backend.capabilities(ollama_model)
+        if "tools" not in caps:
+            pytest.skip(f"{ollama_model} does not support tools (capabilities={caps})")
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Returns the current time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                },
+            }
+        ]
+        tools_path = os.path.join(tmp_dir, "tools.json")
+        with open(tools_path, "w") as f:
+            json.dump(tools, f)
+
+        session_path = os.path.join(tmp_dir, "tools-session.json")
+        self._run(["--json", "session", "new", session_path, "--model", ollama_model])
+
+        result = self._run([
+            "--project", session_path,
+            "--json", "chat", "tools",
+            "What time is it right now?",
+            "--tools-file", tools_path,
+        ])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["status"] == "ok"
+        resp = data["data"]
+        assert "content" in resp
+        assert "tool_calls" in resp
+        assert isinstance(resp["tool_calls"], list)
+        print(f"\n  Tool calls: {resp['tool_calls']}")
+        print(f"  Content: '{resp['content'][:80]}'")
+
+    def test_help_includes_new_commands(self):
+        """--help output includes all new command groups."""
+        result = self._run(["--help"])
+        assert "compare" in result.stdout
+        result2 = self._run(["model", "--help"])
+        assert "search" in result2.stdout
+        assert "capabilities" in result2.stdout
+        result3 = self._run(["chat", "--help"])
+        assert "tools" in result3.stdout
